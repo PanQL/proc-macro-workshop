@@ -2,7 +2,8 @@ use proc_macro::TokenStream;
 use syn::{
     self, DeriveInput, parse_macro_input, spanned::Spanned,
     Fields, DataStruct, Data, FieldsNamed, punctuated::Punctuated,
-    Field, token::Comma,
+    Field, token::Comma, Path, TypePath, PathSegment, Type, PathArguments,
+    AngleBracketedGenericArguments, GenericArgument
 };
 use quote::{quote};
 
@@ -23,22 +24,67 @@ fn do_expand(st: &DeriveInput)  -> syn::Result<proc_macro2::TokenStream> {
     let struct_ident = &st.ident;
     let data_fields = parse_data_fields(st)?;
     let mut builder_fields = proc_macro2::TokenStream::new();
-    let mut build_fn_body = proc_macro2::TokenStream::new();
+    let mut builder_fn_fields = proc_macro2::TokenStream::new();
     let mut builder_impl_func = proc_macro2::TokenStream::new();
+    let mut build_fn_fields = proc_macro2::TokenStream::new();
     data_fields.iter().for_each(|field|{
         let ident = &field.ident;
         let ty = &field.ty;
+        let mut to_wrap_option = true;
+        let new_ty = match ty {
+            Type::Path(TypePath{qself: _, path: Path{
+                leading_colon: _,
+                segments
+            }}) => {
+                match segments.first() {
+                    Some(PathSegment{
+                        ident, 
+                        arguments: PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+                            colon2_token: _,
+                            lt_token: _,
+                            gt_token: _,
+                            args
+                        }),
+                    }) => {
+                        match args.first() {
+                            Some(GenericArgument::Type(new_ty)) => {
+                                if ident.to_string() == "Option" {
+                                    to_wrap_option = false;
+                                    new_ty.clone()
+                                } else {
+                                    ty.clone()
+                                }
+                            },
+                            _ => ty.clone(),
+                        }
+                    },
+                    _ => ty.clone()
+                }
+            }
+            _ => ty.clone()
+        };
+
+
         builder_fields.extend(quote!{
-            #ident: Option<#ty>,
+            #ident: Option<#new_ty>,
         });
-        build_fn_body.extend(quote!{
+        builder_fn_fields.extend(quote!{
             #ident: None,
         });
         builder_impl_func.extend(quote!{
-            pub fn #ident(&mut self, #ident: #ty) -> &mut Self {
+            pub fn #ident(&mut self, #ident: #new_ty) -> &mut Self {
                 self.#ident = Some(#ident);
                 self
             }
+        });
+        build_fn_fields.extend(if to_wrap_option { 
+                quote!{
+                    #ident: self.#ident.take().unwrap(),
+                }
+            } else {
+                quote!{
+                    #ident: self.#ident.take(),
+                }
         });
     });
 
@@ -49,12 +95,17 @@ fn do_expand(st: &DeriveInput)  -> syn::Result<proc_macro2::TokenStream> {
         impl #struct_ident {
             pub fn builder() -> #builder_name_ident {
                 #builder_name_ident {
-                    #build_fn_body
+                    #builder_fn_fields
                 }
             }
         }
         impl #builder_name_ident {
             #builder_impl_func
+            pub fn build(&mut self) -> Option<#struct_ident> {
+                Some(#struct_ident {
+                    #build_fn_fields
+                })
+            }
         }
     };
 
