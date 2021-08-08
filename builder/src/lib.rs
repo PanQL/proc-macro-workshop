@@ -1,18 +1,107 @@
 use proc_macro::TokenStream;
-use syn::{
-    self, DeriveInput, parse_macro_input, spanned::Spanned,
-    Fields, DataStruct, Data, FieldsNamed, punctuated::Punctuated,
-    Field, token::Comma, Path, TypePath, PathSegment, Type, PathArguments,
-    AngleBracketedGenericArguments, GenericArgument
-};
 use quote::{quote};
+use syn::{
+    *, spanned::Spanned, token::Comma, punctuated::Punctuated,
+};
 
-#[proc_macro_derive(Builder)]
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let st = parse_macro_input!(input as DeriveInput);
     match do_expand(&st) {
         Ok(token_stream) => token_stream.into(),
         Err(e) => e.to_compile_error().into(),
+    }
+}
+
+enum InnerType{
+    Atom(Type),
+    OptionInner(Type),
+    VecInner(Type),
+}
+
+fn check_and_fetch_attr_for_vec(attrs: &Vec<Attribute>) -> syn::Result<Option<String>> {
+    let mut ret = Ok(None);
+    attrs.iter().for_each(|attr| {
+        match attr.parse_meta() {
+            Ok(Meta::List(MetaList{
+                path: Path {
+                    segments,
+                    ..
+                },
+                nested,
+                ..
+            })) => {
+                if let Some(segment) = segments.first() {
+                    if segment.ident.to_string().as_str() == "builder" {
+                        match nested.first() {
+                            Some(NestedMeta::Meta(Meta::NameValue(MetaNameValue{
+                                path: Path {
+                                    segments: path_seg,
+                                    ..
+                                },
+                                lit: Lit::Str(lit_str),
+                                ..
+                            }))) => {
+                                match path_seg.first() {
+                                    Some(PathSegment{
+                                        ident,
+                                        ..
+                                    }) => {
+                                        if ident.to_string().as_str() == "each" {
+                                            ret = Ok(Some(lit_str.value()));
+                                        } else {
+                                            if let Ok(list) = attr.parse_meta() {
+                                                ret = Err(syn::Error::new_spanned(list, "expected `builder(each = \"...\")`".to_string()));
+                                            }
+                                        }
+                                    },
+                                    _ => {}
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+            },
+            _ => {}
+        }
+    });
+    ret
+}
+
+fn parse_inner_type(ty: &Type) -> InnerType {
+    match ty {
+        Type::Path(TypePath{qself: _, path: Path{
+            segments,
+            ..
+        }}) => {
+            match segments.first() {
+                Some(PathSegment{
+                    ident, 
+                    arguments: PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+                        args,
+                        ..
+                    }),
+                }) => {
+                    match args.first() {
+                        Some(GenericArgument::Type(new_ty)) => {
+                            match ident.to_string().as_str() {
+                                "Option" => {
+                                    InnerType::OptionInner(new_ty.clone())
+                                },
+                                "Vec" => {
+                                    InnerType::VecInner(new_ty.clone())
+                                },
+                                _ => InnerType::Atom(ty.clone())
+                            }
+                        },
+                        _ => InnerType::Atom(ty.clone()),
+                    }
+                },
+                _ => InnerType::Atom(ty.clone()),
+            }
+        }
+        _ => InnerType::Atom(ty.clone()),
     }
 }
 
@@ -27,66 +116,72 @@ fn do_expand(st: &DeriveInput)  -> syn::Result<proc_macro2::TokenStream> {
     let mut builder_fn_fields = proc_macro2::TokenStream::new();
     let mut builder_impl_func = proc_macro2::TokenStream::new();
     let mut build_fn_fields = proc_macro2::TokenStream::new();
-    data_fields.iter().for_each(|field|{
+
+    for field in data_fields {
+        let attrs = &field.attrs;
+        let field_attr = check_and_fetch_attr_for_vec(attrs)?;
         let ident = &field.ident;
         let ty = &field.ty;
-        let mut to_wrap_option = true;
-        let new_ty = match ty {
-            Type::Path(TypePath{qself: _, path: Path{
-                leading_colon: _,
-                segments
-            }}) => {
-                match segments.first() {
-                    Some(PathSegment{
-                        ident, 
-                        arguments: PathArguments::AngleBracketed(AngleBracketedGenericArguments {
-                            colon2_token: _,
-                            lt_token: _,
-                            gt_token: _,
-                            args
-                        }),
-                    }) => {
-                        match args.first() {
-                            Some(GenericArgument::Type(new_ty)) => {
-                                if ident.to_string() == "Option" {
-                                    to_wrap_option = false;
-                                    new_ty.clone()
-                                } else {
-                                    ty.clone()
-                                }
-                            },
-                            _ => ty.clone(),
-                        }
-                    },
-                    _ => ty.clone()
-                }
-            }
-            _ => ty.clone()
-        };
-
-
-        builder_fields.extend(quote!{
-            #ident: Option<#new_ty>,
-        });
-        builder_fn_fields.extend(quote!{
-            #ident: None,
-        });
-        builder_impl_func.extend(quote!{
-            pub fn #ident(&mut self, #ident: #new_ty) -> &mut Self {
-                self.#ident = Some(#ident);
-                self
-            }
-        });
-        build_fn_fields.extend(if to_wrap_option { 
-                quote!{
-                    #ident: self.#ident.take().unwrap(),
-                }
-            } else {
-                quote!{
+        match (parse_inner_type(ty), field_attr) {
+            (InnerType::OptionInner(new_ty), _) => {
+                builder_fields.extend(quote!{
+                    #ident: core::option::Option<#new_ty>,
+                });
+                builder_fn_fields.extend(quote!{
+                    #ident: core::option::Option::None,
+                });
+                builder_impl_func.extend(quote!{
+                    pub fn #ident(&mut self, #ident: #new_ty) -> &mut Self {
+                        self.#ident = core::option::Option::Some(#ident);
+                        self
+                    }
+                });
+                build_fn_fields.extend(quote!{
                     #ident: self.#ident.take(),
-                }
-        });
-    });
+                });
+            },
+            (InnerType::VecInner(new_ty), Some(interface_name)) => {
+                builder_fields.extend(quote!{
+                    #ident: std::vec::Vec<#new_ty>,
+                });
+                builder_fn_fields.extend(quote!{
+                    #ident: std::vec::Vec::new(),
+                });
+                let ident_func = Ident::new(&interface_name, ident.span());
+                builder_impl_func.extend(quote!{
+                    pub fn #ident_func(&mut self, #ident: #new_ty) -> &mut Self {
+                        self.#ident.push(#ident);
+                        self
+                    }
+                });
+                build_fn_fields.extend(quote!{
+                    #ident: {
+                        let mut res = std::vec::Vec::new();
+                        res.append(&mut self.#ident);
+                        res
+                    },
+                });
+            },
+            _ => {
+                builder_fields.extend(quote!{
+                    #ident: core::option::Option<#ty>,
+                });
+                builder_fn_fields.extend(quote!{
+                    #ident: core::option::Option::None,
+                });
+                builder_impl_func.extend(quote!{
+                    pub fn #ident(&mut self, #ident: #ty) -> &mut Self {
+                        self.#ident = core::option::Option::Some(#ident);
+                        self
+                    }
+                });
+                build_fn_fields.extend(quote!{
+                    #ident: self.#ident.take().unwrap(),
+                });
+            }
+        }
+    }
+
 
     let ret = quote! {
         pub struct #builder_name_ident {
@@ -101,8 +196,8 @@ fn do_expand(st: &DeriveInput)  -> syn::Result<proc_macro2::TokenStream> {
         }
         impl #builder_name_ident {
             #builder_impl_func
-            pub fn build(&mut self) -> Option<#struct_ident> {
-                Some(#struct_ident {
+            pub fn build(&mut self) -> core::option::Option<#struct_ident> {
+                core::option::Option::Some(#struct_ident {
                     #build_fn_fields
                 })
             }
